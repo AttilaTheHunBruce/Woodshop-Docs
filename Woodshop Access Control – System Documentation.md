@@ -86,7 +86,7 @@ There is no event-type field. The server infers it: all of duration, connect tim
 | 0x0001 | ERROR | Generic server error |
 | 0x0002 | MEMBER\_NOT\_FOUND | Reserved |
 | 0x0003 | MACHINE\_DISABLED | Reserved |
-| 0x0004 | MEMBER\_NOT\_AUTHORIZED | Not signed in, inactive or expired, or no permission for this machine |
+| 0x0004 | MEMBER\_NOT\_AUTHORIZED | Not signed in, blocked by the admin, or no permission for this machine |
 | 0x0005 | INVALID\_MESSAGE | Short or malformed message |
 
 The client treats any non-zero status on an INSERT as a denial.
@@ -127,7 +127,7 @@ This format was confirmed with Lee Robertshaw on August 19, 2026. `BruceTestSend
 When a machine sends an INSERT, the server replies `0x0004` (not authorized) unless **all** of these are true:
 
 1. The member has a row in `active_members` (signed in at the kiosk).
-2. The member exists in `data/users.json`, is marked active, and has not expired. A membership counts as current until its expiry date plus 90 days (`MEMBERSHIP_GRACE_DAYS`, the same rule the web app uses).
+2. The member exists in `data/users.json` and is not blocked. Eligibility (dues paid, membership current) is decided by the kiosk (Login), which sends no message for an ineligible member, so the server does not test expiry dates or a grace period. The only local block is the `active` flag: a member whose record is set to inactive on the Users page gets no permissions.
 3. The permission string for the member has a `1` in the character at index machine number minus 1. Bit 0, the first character, is machine 1.
 
 The permission string is re-read from `users.json` on every request, so edits take effect immediately. A message with the override bit (0x01) set skips these checks. If authorized, the server records a session unless one is already open for that member and machine, which makes a repeated INSERT harmless.
@@ -137,6 +137,8 @@ On a REMOVE the server closes the session in the database and appends a row to `
 ### Kiosk messages
 
 A LOGIN looks the member up in `users.json` and inserts or replaces the `active_members` row (name from the message, login time from the message timestamp converted to server local time). A LOGOUT deletes the row. Both also append a `LOGIN` or `LOGOUT` row to `access_log.csv` so they appear on the web Logs page.
+
+**Every kiosk message is trusted.** Login sends a message only for a member it has approved, so the server treats each one as a valid member. On a LOGIN for an ID not yet in `users.json`, `ensure_member()` appends a record (names from the message, active, blank expiry, permission string of 128 `1` characters) and logs `[ENROLL]`. The write is atomic, and a `users.json` that exists but cannot be parsed is left untouched with an error logged. There is no authentication on port 45432; the shop's cameras and club rules are the control against a forged message.
 
 ### Debug trace
 
@@ -167,7 +169,7 @@ Everything lives under the server's install folder (`~/woodshop`). Back up the w
 | Path | Written by | What it holds |
 | --- | --- | --- |
 | `woodshop.db` | `master_server.py` | SQLite database (tables below). Recreated empty if deleted |
-| `data/users.json` | `app.py` (admin pages, CSV import) | Member file: id, first and last name, email, phone, rfid, active flag, joined and expiry dates, 128-character permission string |
+| `data/users.json` | `app.py` (admin pages, CSV import) | Member file: id, first and last name, email, phone, rfid, active flag, joined and expiry dates, 128-character permission string (members are added automatically at their first kiosk login) |
 | `data/machines.json` | `app.py` | Machine list: id, name, location, enabled |
 | `data/admin_creds.json` | `app.py` | Web login: username and SHA-256 password hash. Created as `admin` / `woodshop` if missing, so change it |
 | `data/access_log.csv` | `master_server.py` | The log the web Logs page reads (formats below) |
@@ -199,7 +201,7 @@ The daily backup files use one 12-column layout: the 11 session columns plus an 
 
 ## 5. Server: web app (app.py)
 
-`app.py` is a Flask app on port 80, used from a phone, tablet or laptop on the shop WiFi at `http://192.168.0.5`. Every page except the client endpoints needs the admin login. The top menu on every page reads **Refresh, Logs, Log Files, Active, Users, Machines, Renew, Diagnostics, Logout**.
+`app.py` is a Flask app on port 80, used from a phone, tablet or laptop on the shop WiFi at `http://192.168.0.5`. Every page except the client endpoints needs the admin login. The top menu on every page reads **Refresh, Logs, Log Files, Active, Users, Machines, Diagnostics, Logout**.
 
 | Menu item | Route | What it does |
 | --- | --- | --- |
@@ -209,7 +211,7 @@ The daily backup files use one 12-column layout: the 11 session columns plus an 
 | Active | `/active` | Members currently signed in at the kiosk, with sign-in time and the machines they may use. Reloads itself every 30 s |
 | Users | `/admin/users` | Member list, search, add, edit, delete, CSV import and export |
 | Machines | `/admin/machines` | Machine list and editing, CSV import and export |
-| Renew | `/admin/renew` | Bulk membership renewal: tick the members who paid, choose the year, and their expiry becomes Dec 31 of that year |
+| Renew | `/admin/renew` | Hidden from the menu (the page still works if you type the address). Bulk membership renewal: tick the members who paid, choose the year, and their expiry becomes Dec 31 of that year. Informational only; the server no longer checks it |
 | Diagnostics | `/admin/diag` | Reboot reports posted by the clients |
 | Logout | `/logout` | Ends the session |
 
@@ -219,7 +221,7 @@ Other routes: `/admin/password` (change the admin password), JSON at `/api/logs`
 
 A member's `permissions` value is a 128-character string of `0` and `1`; character 1 is machine 1. In the CSV import the columns are `member_id, first_name, last_name, email, phone, rfid, joined, expiry, active, permissions`. Import merges: rows replace members with the same ID and everyone else is kept. A blank permissions value becomes all zeros (no access).
 
-A membership is current while the member is marked active and today is no later than the expiry date plus 90 days. The Users page colours members by this status, and the server applies the same rule when it decides machine access.
+Members are normally created automatically: the first time the kiosk sends a login for an unknown member ID, the server adds a record with the names from the message, the active flag on, blank expiry, and full access to all 128 machines. An existing record is never changed by a kiosk message, so permissions limited on the Users page stay limited. Use the Users page to restrict a member to certain machines, or to set the active flag off to block someone. The Users list shows only ID, name, how many machines the member may use, and a (blocked) tag when the active flag is off. Email, phone, RFID and expiry are not shown on the list or the edit form; they stay in users.json as hidden form fields, so saving a member never erases them, and they are still in the CSV export and import. The Renew page is hidden from the menu, and expiry does not affect machine access.
 
 ### Client endpoints (no login)
 
@@ -281,7 +283,7 @@ grep -E "NOT AUTHORIZED|INSERT:|Response:" ~/woodshop/master.log | tail -20   # 
 | Symptom | Check |
 | --- | --- |
 | Kiosk message light flashes but nothing happens | `tail master.log`; confirm the running copy has the 45-byte parser (startup line says "expecting 45-byte binary messages") |
-| Member signed in but machine denies | Permission string in `users.json` has no `1` at machine number minus 1, member is inactive or expired, or the machine number does not match |
+| Member signed in but machine denies | Permission string in `users.json` has no `1` at machine number minus 1, member is blocked (active flag off), or the machine number does not match |
 | Machine runs although denied | The server replied 0x0004 but the client firmware is older than the version that acts on it; update the client |
 | Log page looks old | Press Refresh; the Active page reloads itself, Logs does not |
 | Logs missing after a clean-up | A running program kept the deleted file open; restart it |
@@ -508,6 +510,20 @@ Port 80 needs authbind for the non-root user: `sudo touch /etc/authbind/byport/8
 
 **Testing note.** Run the programs as scripts (`python app.py`), as the units do. Pasting them into the Python 3.13 interactive shell can point `__file__`, and so every data path, at the REPL launcher.
 
+**Reference copies on the Pi.** So the whole project can be found years from now, the Pi holds the source and documentation: `~/woodshop/` is the running server source; `~/reference/Client/` is the client Arduino sketch (open `Client.ino`); `~/reference/Docs/` is this document as PDF and Markdown; `~/README.txt` lists these, the two services and the three GitHub repositories (`Woodshop-Server`, `Woodshop-Client`, `Woodshop-Docs`, all public). The last step of `bootstrap.sh` clones the Client and Docs repositories into `~/reference/` (or fetches and hard-resets them if already there), so every bootstrap run refreshes all three copies. If a clone fails, for example because the Pi has no internet, the script prints a warning and carries on, since the server does not depend on them. Do not edit the files under `~/reference/`; the next run overwrites them. Live data in `~/woodshop/data/` is not in git, so back it up separately.
+
+### Public repository and credentials
+
+The three GitHub repositories are public, so the source contains placeholders instead of live credentials. **Before building or installing, edit these:**
+
+- **WiFi name and password (client).** In `config.h`, set `WIFI_SSID` and `WIFI_PASSWORD`. The repository holds `YOUR_SSID` and `YOUR_PASSWORD`. Every client needs the real values, so a newly built unit joins the network only after this edit. Also check `MACHINE_NUMBER` and raise `FW_VERSION` for each release.
+- **Same network on the server side.** The server holds no WiFi credentials. The Pi is wired (eth0) and takes its address from DHCP; section 13 explains how `derive-static-ip.sh` sets the last octet to 5. The WiFi access point must put the clients on the same subnet as the Pi.
+- **Web admin login (server).** `app.py` creates `admin` / `woodshop` the first time it runs, if `data/admin_creds.json` is missing. This is a default, not a secret: change it at once on the Admin password page. The stored login is a hash in `data/admin_creds.json`, which is not in git.
+- **Test tools.** `BruceTestSender_esp32.py` (MicroPython) has its own `WIFI_SSID` and `WIFI_PASSWORD` lines; fill them in the same way. `esp32_client.py` is obsolete and should not be distributed.
+- **Not secret.** The Ed25519 public key in `config.h` is meant to be public. The server's private signing key is not part of this project.
+
+**Where the real values are.** Keep the live SSID and password in a private place (the private copy of this document, a sealed note in the shop, or the router's own settings). Anyone rebuilding the system years from now needs three things: the WiFi name and password, the Pi's admin login, and the GitHub account that owns the repositories. If the WiFi password changes, every client must be rebuilt with the new value and reflashed over USB, because a unit that cannot join WiFi cannot receive an over-the-air update.
+
 ### First-run checks on the server
 
 | Check | How | Expect |
@@ -560,8 +576,9 @@ Write cards on a Raspberry Pi with a PN532 reader on SPI, using `rfid_write.py` 
 | 8 | Default admin login | `admin` / `woodshop` is created if the credentials file is missing. Change it |
 | 9 | Unused files | `current_sensor_task.c` and `current_sensor_dsp.c` are not referenced by the sketch; the build uses `current_sense.cpp`. `esp32_client.py` is obsolete |
 | 10 | Not yet reviewed | `diag.cpp`, `ota_task.cpp` and `current_sense.cpp` were read for their header descriptions, not line by line |
+| 11 | Kiosk sends only eligible members | The server assumes that Login never sends a message for a member who has not paid dues. If Login were to send ineligible members the server would log them in and enrol them with full access. To be confirmed with Lee Robertshaw |
 
-This document describes the code as supplied on the date above, including the changes made in this project: the 45-byte kiosk parser, kiosk rows in the web log, the live permission lookup with bit 0 = machine 1, inactive and expired members denied, the server-veto handling and 1.5 s blast hold-off in the client, the yellow-only no-network LED, the Refresh menu item, the daily log files and download page, and the daily NTP job.
+This document describes the code as supplied on the date above, including the changes made in this project: the 45-byte kiosk parser, kiosk rows in the web log, the live permission lookup with bit 0 = machine 1, members added automatically with full access on their first kiosk login, expiry no longer checked by the server, the server-veto handling and 1.5 s blast hold-off in the client, the yellow-only no-network LED, the Refresh menu item, the daily log files and download page, and the daily NTP job.
 
 ## 15. Index
 
@@ -607,6 +624,8 @@ Numbers are section numbers.
 | override switches | 8, 10 |
 | permissions (bit 0 = machine 1) | 3, 5, 9 |
 | ports 35487, 45432, 80 | 2 |
+| public repository, credentials, placeholders | 13 |
+| reference copies (client, docs) | 13 |
 | Refresh menu item | 5 |
 | relays | 8, 9 |
 | Renew (membership) | 5 |
