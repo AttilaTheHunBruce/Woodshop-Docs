@@ -201,7 +201,7 @@ The daily backup files use one 12-column layout: the 11 session columns plus an 
 
 ## 5. Server: web app (app.py)
 
-`app.py` is a Flask app on port 80, used from a phone, tablet or laptop on the shop WiFi at `http://192.168.0.5`. Every page except the client endpoints needs the admin login. The top menu on every page reads **Refresh, Logs, Log Files, Active, Users, Machines, Diagnostics, Logout**.
+`app.py` is a Flask app on port 80, used from a phone, tablet or laptop on the shop WiFi at `http://192.168.0.5`. Every page except the client endpoints needs the admin login. The top menu on every page reads **Refresh, Logs, Log Files, Active, Users, Machines, Admin Card, Diagnostics, Logout**.
 
 | Menu item | Route | What it does |
 | --- | --- | --- |
@@ -214,6 +214,7 @@ The daily backup files use one 12-column layout: the 11 session columns plus an 
 | Renew | `/admin/renew` | Hidden from the menu (the page still works if you type the address). Bulk membership renewal: tick the members who paid, choose the year, and their expiry becomes Dec 31 of that year. Informational only; the server no longer checks it |
 | Diagnostics | `/admin/diag` | Reboot reports posted by the clients |
 | Logout | `/logout` | Ends the session |
+| Admin Card | /admin/card | Write or read the machine admin card (machine number, name, blast-gate delay) using the server's card reader; runs rfid\_admin\_card.py |
 
 Other routes: `/admin/password` (change the admin password), JSON at `/api/logs` and `/api/active`, CSV export at `/api/users/export.csv`, `/api/machines/export.csv` and `/api/log/export.csv`, CSV import at `/api/users/import.csv` and `/api/machines/import.csv`.
 
@@ -291,7 +292,7 @@ grep -E "NOT AUTHORIZED|INSERT:|Response:" ~/woodshop/master.log | tail -20   # 
 
 ## 8. Client: hardware and firmware structure
 
-Each machine has one ESP32 board running the sketch `Client.ino` (Arduino IDE 2.3.10, board "ESP32 Dev Module"). Firmware version is `FW_VERSION` in `config.h` (1.0.5 at the time of writing). Libraries: Elechouse PN532 (`PN532`, `PN532_SPI`), rweather Crypto (Ed25519), ArduinoJson. The Tools > Partition Scheme must be one of the "with OTA" schemes or firmware updates cannot be installed.
+Each machine has one ESP32 board running the sketch `Client.ino` (Arduino IDE 2.3.10, board "ESP32 Dev Module"). Firmware version is `FW_VERSION` in `config.h` (1.0.5 at the time of writing). Libraries: Elechouse PN532 (`PN532`, `PN532_SPI`), ArduinoJson. The Tools > Partition Scheme must be one of the "with OTA" schemes or firmware updates cannot be installed.
 
 ### Pins (`config.h`)
 
@@ -326,7 +327,7 @@ A bulk capacitor of 470 uF or more from 3V3 to ground, close to the ESP32, is re
 
 **Shared state.** All tasks share one `g_session` record (card active, member ID, authorized flag, start time, run time, average current, starts, stops, override flags) guarded by a mutex. Each hardware resource has one owner: the relay pins belong to `task_relay`, the PN532 to `task_rfid`, the override switches to `task_override`, and the ADC to the current-sense task.
 
-**Saved settings.** The machine number (1 to 128; default 1) and blast-gate run-on time (default 30 s) are stored in flash (NVS, namespace `woodshop`) and change only through a signed config card.
+**Saved settings.** The machine number (1 to 128; default 1) and blast-gate run-on time (default 30 s) are stored in flash (NVS, namespace `woodshop`) and change only through an admin card (section 10).
 
 **Build modes.** `DEV_BUILD` (commented out in `config.h`) disables the brown-out detector and stretches the watchdog for bench work. Leave it off for installed units so resets are logged rather than silent.
 
@@ -344,7 +345,7 @@ Cards are NTAG215 tags written by `rfid_write.py` (companion to Lee Robertshaw's
 | 36 to 51 | Last name, ASCII, null-padded |
 | 52 onward | Zero |
 
-Member cards carry no signature, so the client trusts what is written on the card. Config cards (type byte 0x02, machine number, blast-gate delay in 10 s units, Ed25519 signature) are verified against the server's public key before they change the saved machine number or blast delay. A card whose first four bytes are not digits and is not a config card is rejected as unrecognised.
+Neither card type carries a signature, so the client trusts what is written on the card. The **admin card** (also called the config card) is recognised by its first byte, 0x02, which can never be an ASCII digit: byte 1 is the version (2; version 1 cards, which have no name, are still accepted), byte 2 the machine number, byte 3 the blast-gate delay in 10 s units (0 to 15), byte 4 reserved, and bytes 5 to 20 a 16-byte ASCII machine name. The client displays the name on the serial monitor but does not store or use it. A card whose first four bytes are not digits and is not an admin card is rejected as unrecognised.
 
 ### What happens when a card is presented
 
@@ -411,7 +412,7 @@ At every boot the client records why it restarted (reset reason) and what it was
 
 ### Changing machine number or blast delay
 
-Present a signed config card to the machine. The server's private key signs these cards. The client checks the signature, the version byte (1) and the range (blast delay up to 150 s), then saves the values to flash.
+Present an admin card to the machine's reader when no member is using it. The client checks the version byte (1 or 2) and the range (blast delay up to 150 s), then saves the machine number and blast delay to flash; the green and yellow LEDs flash together for two seconds when it is accepted. Write cards with the **Admin Card** page of the web app (Machines menu, next to it): choose a machine from the list or type a number, name and delay, put a blank card on the server's reader, click Write card, and leave it until the page shows the result. Read card shows what a card holds. The page runs `rfid_admin_card.py`, which can also be used from a shell: `venv/bin/python rfid_admin_card.py write --machine 3 --name "Table Saw" --blast 30` or `... read`. The tool refuses to overwrite a card that holds a member card (`--force` overrides) and reads the card back to verify. Admin cards are not signed, so anyone with a writer can reconfigure a machine.
 
 ## 11. Test and support tools
 
@@ -422,6 +423,7 @@ Present a signed config card to the machine. The server's private key signs thes
 | `rfid_write.py` | Raspberry Pi with a PN532 on SPI | Writes member cards. Example: `python3 rfid_write.py --id 42 --first Jane --last Doe --machines 1,3,5`. Accepts ranges (`1-10,20`), `all` or `none`; member ID 0 to 9999; names up to 16 ASCII characters; `--dry-run` shows the bytes without a card; it verifies by reading back. Needs `adafruit-circuitpython-pn532`, Blinka and a GPIO library, and SPI enabled |
 | `esp32_client.py` | ESP32 with MicroPython | Obsolete. Sends the earlier 52-byte ASCII format, which the server no longer accepts |
 | `set_ota.py` | Server | Turns the firmware-update flag on or off and restarts the TCP service. Edits the UPDATE\_AVAILABLE line at the top of master\_server.py (true, false or status), restarts the woodshop-tcp service with sudo, and kills any stale process still holding port 35487. Its help text says nodes download on their next reboot; in practice they act on the next card event or within 10 minutes |
+| rfid\_admin\_card.py | Server (Pi with PN532 on SPI) | Writes and reads the machine admin card: write --machine 3 --name "Table Saw" --blast 30, or read. --json for scripts, --dry-run builds a card without a reader, --force overwrites a member card, --no-reset / --reset-pin for the PN532 reset wiring. The Admin Card web page calls it; a USB reader version can replace it if the command line and JSON output are kept |
 
 The card writer's permission bitmap is 16 bytes, four little-endian 32-bit words, with machine 1 at bit 0. It matches the client's reader.
 
@@ -436,10 +438,11 @@ The server package is a folder of plain files plus a Python environment.
 | Include | Notes |
 | --- | --- |
 | `master_server.py`, `app.py` | The current versions of both |
+| rfid\_admin\_card.py, requirements-card.txt | Admin card reader tool and the optional libraries it needs (PN532 reader on SPI); used by the Admin Card page |
 | `set_ota.py` | Firmware-update switch; run it from the server folder, it edits master\_server.py in place |
 | `firmware/` | `firmware.bin` and `version.txt`, only if you use over-the-air updates |
 | `data/users.json`, `data/machines.json`, `data/admin_creds.json` | Optional starting data. If left out, the web app creates demo data on first start |
-| Service files | `woodshop.service` and `woodshop-tcp.service` (not supplied) |
+| Service files | `woodshop.service` and `woodshop-tcp.service` (in deploy/, copied by bootstrap.sh) |
 
 Do not include `master.log`, `woodshop.db`, `data/access_log.csv`, `data/logs/`, `venv/`, test senders or backup copies; the programs create what they need.
 
@@ -448,7 +451,7 @@ Python packages are listed in `requirements.txt`: Flask 2.3 or later (below 3) a
 ### Client: build the firmware
 
 1. Install Arduino IDE 2.3.10 and the Espressif ESP32 board package (an ESP-IDF 5.x based release).
-2. Install the libraries: the Elechouse PN532 library (the `PN532` and `PN532_SPI` folders; install from its GitHub release if it is not in the Library Manager), `Crypto` by rweather, and `ArduinoJson` by bblanchon.
+2. Install the libraries: the Elechouse PN532 library (the `PN532` and `PN532_SPI` folders; install from its GitHub release if it is not in the Library Manager) and `ArduinoJson` by bblanchon. The rweather `Crypto` library is no longer needed.
 3. Create a folder named `Client` holding `Client.ino` and the other 21 files (`config.h`, and a `.h` and `.cpp` pair for each of diag, node\_config, led\_ctrl, current\_sense, rfid\_task, override\_task, relay\_ctrl, session\_task, wifi\_task and ota\_task). Leave out `current_sensor_task.c` and `current_sensor_dsp.c`; Arduino compiles every `.c` and `.cpp` file in the folder.
 4. Edit `config.h`: set `WIFI_SSID` and `WIFI_PASSWORD`, check `SERVER_HOST_BYTE` (5 gives 192.168.0.5), set `MACHINE_NUMBER` (used only on a unit's first boot), and raise `FW_VERSION` for each release. Keep `DEV_BUILD` commented out for installed units.
 5. In Tools choose board **ESP32 Dev Module** and a **Partition Scheme with OTA** (two app slots). Without it, over-the-air updates fail with "not enough space".
@@ -504,7 +507,7 @@ Port 80 needs authbind for the non-root user: `sudo touch /etc/authbind/byport/8
 
 **Outside git (per Pi, never touched by a rebuild).** `data/users.json`, `data/machines.json`, `data/admin_creds.json`, `data/active_sessions.json`, `data/diag/`, `access_log.csv`, `master.log`, `woodshop.db`, and `firmware/firmware.bin` with `firmware/version.txt`.
 
-**Delete before pushing.** `server_card_writer.py`, `requirements-nfc.txt` and `deploy/gen_key.py` are deprecated stubs. The server no longer writes cards or signs anything, and `cryptography` is not a dependency.
+**Delete before pushing.** `server_card_writer.py`, `requirements-nfc.txt` and `deploy/gen_key.py` are deprecated stubs. They are replaced by `rfid_admin_card.py` and `requirements-card.txt`, and `cryptography` is not a dependency.
 
 **OTA flag.** `sudo venv/bin/python set_ota.py true|false|status` from `/home/woodshop/woodshop`.
 
@@ -520,7 +523,7 @@ The three GitHub repositories are public, so the source contains placeholders in
 - **Same network on the server side.** The server holds no WiFi credentials. The Pi is wired (eth0) and takes its address from DHCP; section 13 explains how `derive-static-ip.sh` sets the last octet to 5. The WiFi access point must put the clients on the same subnet as the Pi.
 - **Web admin login (server).** `app.py` creates `admin` / `woodshop` the first time it runs, if `data/admin_creds.json` is missing. This is a default, not a secret: change it at once on the Admin password page. The stored login is a hash in `data/admin_creds.json`, which is not in git.
 - **Test tools.** `BruceTestSender_esp32.py` (MicroPython) has its own `WIFI_SSID` and `WIFI_PASSWORD` lines; fill them in the same way. `esp32_client.py` is obsolete and should not be distributed.
-- **Not secret.** The Ed25519 public key in `config.h` is meant to be public. The server's private signing key is not part of this project.
+- **No signing keys.** Admin cards are unsigned, so there is no private key to protect; the Ed25519 library and public key were removed from the client.
 
 **Where the real values are.** Keep the live SSID and password in a private place (the private copy of this document, a sealed note in the shop, or the router's own settings). Anyone rebuilding the system years from now needs three things: the WiFi name and password, the Pi's admin login, and the GitHub account that owns the repositories. If the WiFi password changes, every client must be rebuilt with the new value and reflashed over USB, because a unit that cannot join WiFi cannot receive an over-the-air update.
 
@@ -542,7 +545,7 @@ Point the kiosk at 192.168.0.5, port 45432, and make it send the 45-byte message
 
 1. Wire the board as in the pin table in section 8, with the 470 uF capacitor on 3V3. Mount the card reader so cards sit about 32 mm (1.25 inch) from the antenna.
 2. Flash the first time over USB from the Arduino IDE. Open the Serial Monitor at 115200 baud; the banner shows the firmware version, `[cfg] first boot` and the machine number.
-3. Set the machine number and blast-gate delay: either edit `MACHINE_NUMBER` before flashing, or present a signed config card (open item 4 in section 14 notes that the card-making route needs confirming).
+3. Set the machine number and blast-gate delay: either edit `MACHINE_NUMBER` before flashing, or present an admin card written on the server's Admin Card page (section 10).
 4. After WiFi connects the yellow no-network blink stops. Present a member card: the Serial Monitor prints the card, and `master.log` shows an `INSERT` line.
 
 Later updates go over the air (section 10); no USB cable is needed.
@@ -550,6 +553,8 @@ Later updates go over the air (section 10); no USB cable is needed.
 ### Member cards
 
 Write cards on a Raspberry Pi with a PN532 reader on SPI, using `rfid_write.py` (install the Adafruit PN532 and Blinka packages, enable SPI, and add your user to the `gpio` and `spi` groups, or run it from its own virtual environment). Use `--dry-run` first.
+
+**Admin card reader on the server.** The Admin Card page needs the same PN532 on the Pi's SPI bus as `rfid_write.py`, with SPI enabled (`dietpi-config`, or `raspi-config`) and the `woodshop` user in the `gpio` and `spi` groups. `bootstrap.sh` adds the groups and installs `requirements-card.txt` into the venv; a failure there is only a warning. The PN532 reset line defaults to GPIO 25, which is also the server's first status LED; if both are wired, use `--no-reset` or `--reset-pin` in `rfid_admin_card.py`. Check the reader with `venv/bin/python rfid_admin_card.py read`.
 
 ### Acceptance test
 
@@ -569,7 +574,7 @@ Write cards on a Raspberry Pi with a PN532 reader on SPI, using `rfid_write.py` 
 | 1 | Machine numbering | Permission bits are 1-based (machine 1 is the first character). The server's `MACHINES` name table is 0-based, so machine 1 currently logs as "Band Saw". Confirm whether the controllers are numbered from 0 or 1 and fix the names or the bits to match |
 | 2 | LEDs after a server denial | When the server vetoes a card, the relay drops but the green LED stays on and the yellow LED stays solid for the rest of the session. `rfid_task.cpp` comments describe a server-confirmation routine (`_attempt_server_confirmation()`) with a 30 s retry that is not in the current `wifi_task.cpp`. Decide whether to add a denial indication and the retry |
 | 3 | Fail-open policy | If the server is unreachable the machine keeps running on the card's local grant. This is deliberate in the current design; say so if you want it changed to fail closed |
-| 4 | Config cards | The client accepts only Ed25519-signed config cards. DEPLOY.md says the server no longer creates them (no `/admin/config-card`, no `server_card_writer.py`, no signing key), and `rfid_write.py` cannot sign them either. How config cards are produced now is still unknown; setting `MACHINE_NUMBER` before flashing avoids needing one |
+| 4 | Config cards | Resolved. Admin (config) cards are now unsigned and are written and read by `rfid_admin_card.py` and the Admin Card web page (sections 9 and 10). The machine name on the card is informational only. Anyone with a card writer can reconfigure a machine |
 | 5 | Unsigned member cards | The client trusts the member ID and permissions written on a card. The server's own check (signed in, active, permitted) is the real gate |
 | 6 | Server comments | The header comment of `master_server.py` still describes an older 16-byte layout with event-type and auth-status bytes. The code, and section 2 of this document, use the layout the client actually sends |
 | 7 | Services | Resolved by DEPLOY.md: `woodshop` (web app) and `woodshop-tcp` (server) are systemd units installed by `bootstrap.sh`, running as user `woodshop`. Confirm they are enabled on your Pi with `systemctl is-enabled woodshop woodshop-tcp` |
@@ -591,6 +596,7 @@ Numbers are section numbers.
 | acceptance test | 13 |
 | Active page | 5 |
 | active\_members table | 3, 4 |
+| admin card (machine setup) | 5, 9, 10, 13 |
 | admin login and password | 4, 5, 13 |
 | app.py (web app) | 5, 7, 12 |
 | Arduino IDE and libraries | 12 |
@@ -630,6 +636,7 @@ Numbers are section numbers.
 | relays | 8, 9 |
 | Renew (membership) | 5 |
 | restarting the programs | 7 |
+| rfid\_admin\_card.py | 5, 10, 11, 13 |
 | services (systemd) | 7, 13, 14 |
 | session statistics | 9 |
 | static IP (derive-static-ip) | 2, 13 |
